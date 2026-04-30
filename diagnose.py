@@ -39,15 +39,25 @@ except Exception as e:
     sys.exit(1)
 
 # ── Step 3: DPAPI decrypt ─────────────────────────────────────
-sep("Step 3 — DPAPI decryption (pywin32)")
+sep("Step 3 — DPAPI decryption (ctypes, no pywin32 needed)")
 try:
-    import win32crypt
-    raw = enc_key[5:]  # strip DPAPI prefix
-    _, key = win32crypt.CryptUnprotectData(raw, None, None, None, 0)
-    print(f"  ✓ AES key decrypted: {len(key)} bytes")
-except ImportError:
-    print("  ✗ pywin32 not installed. Run: pip install pywin32")
-    sys.exit(1)
+    import ctypes, ctypes.wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    raw = enc_key[5:]  # strip 'DPAPI' prefix
+    buf = ctypes.create_string_buffer(raw, len(raw))
+    inp = DATA_BLOB(len(raw), buf)
+    out = DATA_BLOB()
+    ok  = ctypes.windll.crypt32.CryptUnprotectData(
+              ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out))
+    if not ok:
+        raise OSError(f"CryptUnprotectData failed: error {ctypes.GetLastError()}")
+    key = ctypes.string_at(out.pbData, out.cbData)
+    ctypes.windll.kernel32.LocalFree(out.pbData)
+    print(f"  ✓ AES key decrypted via ctypes: {len(key)} bytes")
 except Exception as e:
     print(f"  ✗ DPAPI failed: {e}")
     sys.exit(1)

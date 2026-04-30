@@ -9,7 +9,8 @@ Reads session cookies from Claude's Electron cookie store (SQLite).
 Decrypts using Windows DPAPI + AES-256-GCM (same as Chrome on Windows).
 Bypasses Cloudflare via curl_cffi Chrome TLS impersonation.
 
-Requirements: pip install pystray pillow pycryptodome curl_cffi pywin32
+Requirements: pip install pystray pillow pycryptodome curl_cffi
+(NO pywin32 needed — DPAPI is called via ctypes, which is built into Python)
 """
 
 import os
@@ -22,17 +23,33 @@ import base64
 import sqlite3
 import tempfile
 import threading
+import ctypes
+import ctypes.wintypes
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Windows DPAPI import ─────────────────────────────────────────────────────
-try:
-    import win32crypt
-    HAS_DPAPI = True
-except ImportError:
-    HAS_DPAPI = False
-    print("[WARN] pywin32 not installed — cookie decryption will fail")
+# ── Windows DPAPI via ctypes (no pywin32, no DLL issues) ────────────────────
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+def _dpapi_decrypt(data: bytes) -> bytes:
+    """Decrypt bytes using Windows DPAPI — pure ctypes, no pywin32."""
+    buf    = ctypes.create_string_buffer(data, len(data))
+    inp    = _DATA_BLOB(len(data), buf)
+    out    = _DATA_BLOB()
+    ok     = ctypes.windll.crypt32.CryptUnprotectData(
+                ctypes.byref(inp), None, None, None, None, 0, ctypes.byref(out))
+    if not ok:
+        raise OSError(f"CryptUnprotectData failed: {ctypes.GetLastError()}")
+    result = ctypes.string_at(out.pbData, out.cbData)
+    ctypes.windll.kernel32.LocalFree(out.pbData)
+    return result
+
+HAS_DPAPI = True  # ctypes is always available on Windows
 
 # ── AES-GCM import ───────────────────────────────────────────────────────────
 try:
@@ -113,11 +130,8 @@ def _get_aes_key() -> bytes | None:
         encrypted_key = base64.b64decode(b64_key)
         # Strip "DPAPI" prefix (5 bytes)
         encrypted_key = encrypted_key[5:]
-        # Decrypt with Windows DPAPI
-        if not HAS_DPAPI:
-            log.error("pywin32 not available — cannot decrypt key")
-            return None
-        _, key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)
+        # Decrypt with Windows DPAPI via ctypes (no pywin32 needed)
+        key = _dpapi_decrypt(encrypted_key)
         _aes_key_cache = key
         # Cache to disk
         cache.write_bytes(key)
